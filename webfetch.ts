@@ -19,6 +19,7 @@ import {
 	defineTool,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -53,6 +54,7 @@ interface WebFetchDetails {
 	finalUrl: string;
 	status: number;
 	statusText: string;
+	sizeBytes: number;
 	contentType?: string;
 	title?: string;
 	convertedFromHtml: boolean;
@@ -254,20 +256,27 @@ function htmlToMarkdown(html: string, baseUrl: string) {
 	return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function formatFetchedContent(details: WebFetchDetails, body: string) {
+function formatFetchedHeader(details: WebFetchDetails, options: { includeMarkdownConversionNote?: boolean } = {}) {
 	const lines = [
 		"# Web Fetch",
 		"",
 		`- Requested URL: ${details.requestedUrl}`,
 		`- Final URL: ${details.finalUrl}`,
 		`- Status: ${details.status} ${details.statusText}`,
+		`- Size: ${formatSize(details.sizeBytes)}`,
 	];
 
 	if (details.contentType) lines.push(`- Content-Type: ${details.contentType}`);
 	if (details.title) lines.push(`- Title: ${details.title}`);
-	if (details.convertedFromHtml) lines.push("- Note: HTML was converted to simplified Markdown for readability.");
+	if (options.includeMarkdownConversionNote !== false && details.convertedFromHtml) {
+		lines.push("- Note: HTML was converted to simplified Markdown for readability.");
+	}
 
-	return `${lines.join("\n")}\n\n${body}`.trim();
+	return lines.join("\n").trim();
+}
+
+function formatFetchedContent(details: WebFetchDetails, body: string) {
+	return `${formatFetchedHeader(details)}\n\n---\n\n${body}`.trim();
 }
 
 async function writeTempContent(content: string, extension: string) {
@@ -320,6 +329,7 @@ export const webFetchTool = defineTool({
 		}
 
 		const rawText = await response.text();
+		const sizeBytes = new TextEncoder().encode(rawText).length;
 		const convertedFromHtml = looksLikeHtml(rawText, contentType);
 		const title = convertedFromHtml ? extractTitle(rawText) : undefined;
 		const body = convertedFromHtml
@@ -331,6 +341,7 @@ export const webFetchTool = defineTool({
 			finalUrl: response.url,
 			status: response.status,
 			statusText: response.statusText,
+			sizeBytes,
 			...(contentType ? { contentType } : {}),
 			...(title ? { title } : {}),
 			convertedFromHtml,
@@ -360,6 +371,32 @@ export const webFetchTool = defineTool({
 			content: [{ type: "text", text: output }],
 			details,
 		};
+	},
+
+	renderResult(result, { expanded, isPartial }, theme) {
+		if (isPartial) {
+			return new Text(theme.fg("warning", "Fetching..."), 0, 0);
+		}
+
+		const details = result.details as WebFetchDetails | undefined;
+		if (!expanded && details) {
+			const label = (text: string) => theme.fg("success", theme.bold(text));
+			const value = (text: string) => theme.fg("toolOutput", text);
+			const lines = [
+				`${label("Requested URL:")} ${value(details.requestedUrl)}`,
+				`${label("Status:")} ${value(`${details.status} ${details.statusText}`)}`,
+				`${label("Size:")} ${value(formatSize(details.sizeBytes))}`,
+			];
+
+			if (details.contentType) lines.push(`${label("Content-Type:")} ${value(details.contentType)}`);
+			if (details.title) lines.push(`${label("Title:")} ${value(details.title)}`);
+
+			return new Text(lines.join("\n"), 0, 0);
+		}
+
+		const content = result.content.find((item) => item.type === "text");
+		const text = content?.type === "text" ? content.text : "";
+		return new Text(theme.fg("toolOutput", text ?? ""), 0, 0);
 	},
 });
 

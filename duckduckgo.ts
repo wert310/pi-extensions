@@ -6,6 +6,7 @@
  */
 
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const DUCKDUCKGO_HTML_URL = "https://duckduckgo.com/html/";
@@ -252,6 +253,22 @@ export const duckDuckGoTool = defineTool({
 			content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
 			details: payload,
 		};
+	},
+
+	renderResult(result, { expanded, isPartial }, theme) {
+		if (isPartial) {
+			return new Text(theme.fg("warning", "Searching..."), 0, 0);
+		}
+
+		const details = result.details as DuckDuckGoSearchPayload | undefined;
+		if (!expanded) {
+			const count = details?.results.length ?? 0;
+			return new Text(theme.fg("success", `${count} result${count === 1 ? "" : "s"}`), 0, 0);
+		}
+
+		const content = result.content.find((item) => item.type === "text");
+		const text = content?.type === "text" ? content.text : "";
+		return new Text(theme.fg("toolOutput", text ?? ""), 0, 0);
 	},
 });
 
