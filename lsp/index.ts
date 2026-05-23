@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { homedir } from "node:os";
 import { StringEnum, Type, type Static } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
@@ -56,9 +57,15 @@ type ProjectMatch = {
 type OpenFile = { version: number; text: string };
 type LspDiagnostic = Diagnostic & { isSilent?: boolean };
 
+type LeanGoalResult = {
+  goals: string[];
+  rendered: string;
+};
+
 type Params = Static<typeof LspParams>;
 
 const READY_TIMEOUT_MS = 20_000;
+const LOG_FILE = path.join(homedir(), ".pi", "agent", "extensions", "lsp", "lsp-errors.log");
 const LANGUAGES: LanguageConfig[] = [
   {
     id: "lean",
@@ -88,8 +95,8 @@ const LANGUAGES: LanguageConfig[] = [
 ];
 const SUPPORTED_LABEL = LANGUAGES.map((language) => language.label).join(", ");
 
-const ACTIONS = ["definition", "references", "hover", "diagnostics", "restart_file"] as const;
-const POSITION_ACTIONS = ["definition", "references", "hover"] as const;
+const ACTIONS = ["definition", "references", "hover", "diagnostics", "restart_file", "goal"] as const;
+const POSITION_ACTIONS = ["definition", "references", "hover", "goal"] as const;
 
 const LspParams = Type.Object({
   action: StringEnum(ACTIONS),
@@ -97,6 +104,7 @@ const LspParams = Type.Object({
   line: Type.Optional(Type.Number({ description: "1-indexed line" })),
   column: Type.Optional(Type.Number({ description: "1-indexed column" })),
   query: Type.Optional(Type.String({ description: "Text query used to resolve a position inside the file" })),
+  format: Type.Optional(StringEnum(["text", "structured"], { description: "Output format for goal: 'text' (default) or 'structured'" })),
 });
 
 function stripAt(filePath: string): string {
@@ -189,6 +197,16 @@ function cancelledResult() {
   };
 }
 
+function logError(message: string): void {
+  try {
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] ${message}\n`;
+    fs.appendFileSync(LOG_FILE, logEntry);
+  } catch {
+    // Silently ignore logging failures
+  }
+}
+
 function sameRange(a: Diagnostic["range"], b: Diagnostic["range"]): boolean {
   return (
     a.start.line === b.start.line &&
@@ -247,6 +265,13 @@ function formatHover(contents: unknown): string {
   return "";
 }
 
+function formatGoal(result: LeanGoalResult | null, format: "text" | "structured" = "text"): string {
+  if (!result) return "No goal at this position (not in a proof or LSP not available).";
+  if (format === "structured") {
+    return JSON.stringify(result, null, 2);
+  }
+  return result.rendered || (result.goals.length ? result.goals.join("\n\n") : "no goals");
+}
 
 function buildHeader(action: Params["action"], query?: string, line?: number, column?: number): string {
   const lines = [`action: ${action}`];
@@ -262,26 +287,43 @@ function escapeRegExp(text: string): string {
 function resolveQueryInFile(filePath: string, query: string, action: Params["action"]): { line: number; column: number } | null {
   const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
   const pattern = new RegExp(`\\b${escapeRegExp(query)}\\b`, "g");
+  // Match definition keywords
   const declaration = /^\s*(def|theorem|lemma|axiom|abbrev|opaque|class|instance|structure|inductive|syntax|macro|notation)\b/;
-  let fallback: { line: number; column: number } | null = null;
+  let exactMatch: { line: number; column: number } | null = null;
+  let declMatch: { line: number; column: number } | null = null;
+  let anyMatch: { line: number; column: number } | null = null;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
     const matches = [...line.matchAll(pattern)];
     if (matches.length === 0) continue;
 
-    if ((action === "definition" || action === "references" || action === "hover") && declaration.test(line)) {
-      fallback ??= { line: index + 1, column: (matches[0]!.index ?? 0) + 1 };
-      if (matches.length > 1) {
-        return { line: index + 1, column: (matches[1]!.index ?? 0) + 1 };
-      }
+    // Skip comments
+    const trimmed = line.trim();
+    if (trimmed.startsWith("--") || trimmed.startsWith("/-") || trimmed.startsWith("*")) continue;
+
+    const firstCol = (matches[0]!.index ?? 0) + 1;
+
+    // Check for exact definition: "def queryName" or "abbrev queryName"
+    const exactDefPattern = new RegExp(`^(\\s*)(def|abbreviation|abbrev)\\s+${escapeRegExp(query)}\\b`);
+    if (exactDefPattern.test(line)) {
+      exactMatch = { line: index + 1, column: firstCol };
+      // Continue searching to find the best match (in case there are multiple defs)
       continue;
     }
 
-    return { line: index + 1, column: (matches[0]!.index ?? 0) + 1 };
+    // Check for other declarations (theorem, lemma, etc.)
+    if (declaration.test(line)) {
+      declMatch ??= { line: index + 1, column: firstCol };
+      continue;
+    }
+
+    // Any other occurrence
+    anyMatch ??= { line: index + 1, column: firstCol };
   }
 
-  return fallback;
+  // Return best match: exact def > declaration > any occurrence
+  return exactMatch ?? declMatch ?? anyMatch;
 }
 
 function findProject(fileOrDirectory: string): ProjectMatch | undefined {
@@ -334,20 +376,41 @@ class LspServer {
   }
 
   static async start(project: ProjectMatch): Promise<LspServer | undefined> {
-    const process = spawn(project.config.command, project.config.args, {
-      cwd: project.root,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let process: ChildProcessWithoutNullStreams;
+    try {
+      process = spawn(project.config.command, project.config.args, {
+        cwd: project.root,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      const errorMsg = `Failed to spawn ${project.config.command} ${project.config.args.join(" ")}: ${error instanceof Error ? error.message : String(error)}`;
+      logError(errorMsg);
+      return undefined;
+    }
     const server = new LspServer(
       project,
       process,
       createMessageConnection(new StreamMessageReader(process.stdout), new StreamMessageWriter(process.stdin)),
     );
 
-    process.stdin.on("error", () => {});
-    process.stdout.on("error", () => {});
-    process.stderr.on("data", () => {});
-    process.stderr.on("error", () => {});
+    process.stdin.on("error", (error) => {
+      logError(`stdin error for ${project.config.command}: ${error.message}`);
+    });
+    process.stdout.on("error", (error) => {
+      logError(`stdout error for ${project.config.command}: ${error.message}`);
+    });
+    process.stderr.on("data", (data) => {
+      logError(`stderr from ${project.config.command}: ${data.toString().trim()}`);
+    });
+    process.stderr.on("error", (error) => {
+      logError(`stderr error for ${project.config.command}: ${error.message}`);
+    });
+    process.on("error", (error) => {
+      logError(`process error for ${project.config.command}: ${error.message}`);
+    });
+    process.on("exit", (code, signal) => {
+      logError(`process exited for ${project.config.command}: code=${code}, signal=${signal}`);
+    });
 
     server.connection.onNotification("textDocument/publishDiagnostics", (params: any) => {
       const filePath = uriToPath(params.uri);
@@ -395,6 +458,12 @@ class LspServer {
     server.connection.listen();
 
     try {
+      // Check if process already failed before trying to initialize
+      if (process.exitCode !== null) {
+        logError(`Process exited before initialization with code ${process.exitCode}`);
+        return undefined;
+      }
+      
       await withTimeout(
         server.connection.sendRequest(InitializeRequest.method, {
           processId: process.pid,
@@ -414,9 +483,16 @@ class LspServer {
         `${project.config.label} initialize`,
       );
 
-      server.connection.sendNotification(InitializedNotification.type, {});
+      // Check again after initialization
+      if (process.exitCode !== null) {
+        logError(`Process exited after initialization with code ${process.exitCode}`);
+        return undefined;
+      }
+      
+      server.connection.sendNotification(InitializedNotification.type, {}).catch(() => {});
       return server;
-    } catch {
+    } catch (error) {
+      logError(`Initialization failed for ${project.config.label}: ${error instanceof Error ? error.message : String(error)}`);
       try { process.kill(); } catch {}
       return undefined;
     }
@@ -574,6 +650,20 @@ class LspServer {
     return [...(this.diagnostics.get(synced.filePath) ?? [])];
   }
 
+  async goal(filePath: string, line: number, column: number): Promise<LeanGoalResult | null> {
+    try {
+      const synced = await this.prepare(filePath, "normal", true);
+      const result = await this.connection.sendRequest("$/lean/plainGoal", {
+        textDocument: { uri: synced.uri },
+        position: position(line, column),
+      });
+      return result as LeanGoalResult | null;
+    } catch (error) {
+      logError(`goal request failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
   async shutdown(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -618,6 +708,13 @@ export default function (pi: ExtensionAPI) {
   let startFailed = false;
   let warmup: Promise<void> | undefined;
   let setStatus: ((key: string, text: string | undefined) => void) | undefined;
+
+  // Ensure log directory exists
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+  } catch {
+    // Ignore directory creation errors
+  }
 
   const updateStatus = () => {
     if (!setStatus) return;
@@ -664,12 +761,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "lsp",
     label: "LSP",
-    description: `Query the project language server. Supported right now: ${SUPPORTED_LABEL}. Actions: definition, references, hover, diagnostics, restart_file. Use action=diagnostics on a file after edits to check for errors and warnings. Use action=restart_file when diagnostics say imports are out of date and must be rebuilt or mention the editor Restart File command; it returns fresh diagnostics after rebuild.`,
-    promptSnippet: `Query the project language server. Supported right now: ${SUPPORTED_LABEL}. Use action=diagnostics after edits to check for errors.`,
+    description: `Query the project language server. Supported right now: ${SUPPORTED_LABEL}. Actions: definition, references, hover, diagnostics, restart_file, goal. Use action=diagnostics on a file after edits to check for errors and warnings. Use action=restart_file when diagnostics say imports are out of date and must be rebuilt or mention the editor Restart File command; it returns fresh diagnostics after rebuild. Use action=goal to get the current proof goal state in Lean (shows hypotheses and what needs to be proved).`,
+    promptSnippet: `Query the project language server. Supported right now: ${SUPPORTED_LABEL}. Use action=diagnostics after edits to check for errors. Use action=goal to see Lean proof states.`,
     promptGuidelines: [
       "Use lsp action=diagnostics after editing a supported file to check for errors and warnings.",
       "Use lsp for definition lookup, references, and hover info in a supported project.",
       "Use lsp action=restart_file when diagnostics say imports are out of date and must be rebuilt or mention the editor Restart File command; it returns fresh diagnostics after rebuild.",
+      "Use lsp action=goal in Lean files to see the current proof goal (tactic state) at a cursor position.",
     ],
     parameters: LspParams,
 
@@ -688,9 +786,11 @@ export default function (pi: ExtensionAPI) {
 
         const server = await openServer(absolute, signal);
         if (!server) {
+          const errorMsg = `Found a ${project.config.label} project for ${displayPath(absolute, ctx.cwd)}, but could not start ${project.config.command} ${project.config.args.join(" ")}.`;
+          logError(errorMsg);
           return {
-            content: [{ type: "text" as const, text: `Found a ${project.config.label} project for ${displayPath(absolute, ctx.cwd)}, but could not start ${project.config.command} ${project.config.args.join(" ")}.` }],
-            details: { startFailed: true },
+            content: [{ type: "text" as const, text: `${errorMsg} Check ${LOG_FILE} for details.` }],
+            details: { startFailed: true, logFile: LOG_FILE },
           };
         }
 
@@ -746,9 +846,19 @@ export default function (pi: ExtensionAPI) {
               details: diagnostics,
             };
           }
+          case "goal": {
+            const result = await abortable(server.goal(absolute, line!, column!), signal);
+            const format = input.format || "text";
+            const body = truncateText(`${buildHeader(input.action, input.query, line, column)}\n${formatGoal(result, format)}`);
+            return {
+              content: [{ type: "text" as const, text: body }],
+              details: result,
+            };
+          }
         }
       } catch (error) {
         if (signal?.aborted || (error instanceof Error && error.message === "aborted")) return cancelledResult();
+        logError(`Tool execution error: ${error instanceof Error ? error.message : String(error)}`);
         throw error;
       }
     },
@@ -769,5 +879,27 @@ export default function (pi: ExtensionAPI) {
     await shutdownServers();
     updateStatus();
     setStatus = undefined;
+  });
+
+  pi.registerCommand("lsp-errors", {
+    description: "Show recent LSP server errors from the log file",
+    handler: async (_args, ctx) => {
+      try {
+        if (!fs.existsSync(LOG_FILE)) {
+          ctx.ui.notify("No LSP errors logged yet", "info");
+          return;
+        }
+        const content = fs.readFileSync(LOG_FILE, "utf8");
+        const lines = content.split("\n").filter(Boolean);
+        const recent = lines.slice(-50); // Last 50 entries
+        if (recent.length === 0) {
+          ctx.ui.notify("No LSP errors logged yet", "info");
+          return;
+        }
+        ctx.ui.notify(`Recent LSP errors (${recent.length} entries):\n${recent.join("\n")}`, "info");
+      } catch (error) {
+        ctx.ui.notify(`Failed to read log file: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
   });
 }
