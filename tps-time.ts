@@ -23,6 +23,10 @@ export default function (pi: ExtensionAPI) {
 	let currentLiveStats: MessageStats | null = null;
 	let totalTokens = 0;
 	let totalStreamMs = 0;
+	let totalToolMs = 0;
+	let agentRunStart: number | null = null;
+	let currentToolWindowStart: number | null = null;
+	let totalsApproximate = false;
 	let lastMessageStats: MessageStats | null = null;
 	const activeTools = new Map<string, ActiveTool>();
 	let toolStatusTimer: ReturnType<typeof setInterval> | null = null;
@@ -48,6 +52,10 @@ export default function (pi: ExtensionAPI) {
 		resetCurrentMessage();
 		totalTokens = 0;
 		totalStreamMs = 0;
+		totalToolMs = 0;
+		agentRunStart = null;
+		currentToolWindowStart = null;
+		totalsApproximate = false;
 		lastMessageStats = null;
 		activeTools.clear();
 		stopToolStatusTimer();
@@ -126,6 +134,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		resetAgentState(ctx);
+		agentRunStart = Date.now();
 	});
 
 	pi.on("message_start", async (event) => {
@@ -212,6 +221,7 @@ export default function (pi: ExtensionAPI) {
 			lastMessageStats = completedStats;
 			totalStreamMs += completedStats.elapsedMs;
 			totalTokens += completedStats.tokens;
+			totalsApproximate ||= completedStats.approximate;
 			updateIdleStatus(ctx);
 		} else if (activeTools.size === 0) {
 			lastMessageStats = null;
@@ -222,9 +232,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_start", async (event, ctx) => {
+		const now = Date.now();
+		if (activeTools.size === 0) currentToolWindowStart = now;
 		activeTools.set(event.toolCallId, {
 			toolName: event.toolName,
-			startedAt: Date.now(),
+			startedAt: now,
 		});
 		ensureToolStatusTimer(ctx);
 		updateIdleStatus(ctx);
@@ -237,28 +249,51 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_execution_end", async (event, ctx) => {
 		activeTools.delete(event.toolCallId);
-		if (activeTools.size === 0) stopToolStatusTimer();
-		else toolStatusCtx = ctx;
+		if (activeTools.size === 0) {
+			if (currentToolWindowStart != null) {
+				totalToolMs += Math.max(0, Date.now() - currentToolWindowStart);
+				currentToolWindowStart = null;
+			}
+			stopToolStatusTimer();
+		} else toolStatusCtx = ctx;
 		updateIdleStatus(ctx);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
+		const now = Date.now();
+
 		if (currentMessageStart != null && currentLiveStats) {
 			lastMessageStats = currentLiveStats;
 			totalStreamMs += currentLiveStats.elapsedMs;
 			totalTokens += currentLiveStats.tokens;
+			totalsApproximate ||= currentLiveStats.approximate;
+		}
+
+		if (currentToolWindowStart != null) {
+			totalToolMs += Math.max(0, now - currentToolWindowStart);
+			currentToolWindowStart = null;
+		}
+
+		if (totalTokens > 0 && totalStreamMs > 0) {
+			lastMessageStats = {
+				tokens: totalTokens,
+				elapsedMs: totalStreamMs,
+				approximate: totalsApproximate,
+				tps: Math.max(1, Math.round((totalTokens * 1000) / totalStreamMs)),
+			};
 		}
 
 		activeTools.clear();
 		stopToolStatusTimer();
 		updateIdleStatus(ctx);
 
-		const timestamp = Date.now();
-		const seconds = totalStreamMs / 1000;
-		const tps = seconds > 0 && totalTokens > 0 ? Math.round(totalTokens / seconds) : 0;
-		const prefix = `${ctx.ui.theme.fg("dim", `[${new Date(timestamp).toLocaleTimeString()}]`)} ${ctx.ui.theme.fg("success", "✓")}`;
-		const stats = totalTokens > 0 && seconds > 0
-			? `${ctx.ui.theme.fg("accent", `${tps} t/s overall`)} ${ctx.ui.theme.fg("dim", `${totalTokens} tokens in ${seconds.toFixed(1)}s`)}`
+		const streamedSeconds = totalStreamMs / 1000;
+		const toolSeconds = totalToolMs / 1000;
+		const totalSeconds = agentRunStart != null ? Math.max(0, (now - agentRunStart) / 1000) : streamedSeconds + toolSeconds;
+		const tps = streamedSeconds > 0 && totalTokens > 0 ? Math.round(totalTokens / streamedSeconds) : 0;
+		const prefix = `${ctx.ui.theme.fg("dim", `[${new Date(now).toLocaleTimeString()}]`)} ${ctx.ui.theme.fg("success", "✓")}`;
+		const stats = totalTokens > 0 && streamedSeconds > 0
+			? `${ctx.ui.theme.fg("accent", `${tps} t/s overall`)} ${ctx.ui.theme.fg("dim", `· ${totalTokens} tokens in ${streamedSeconds.toFixed(1)}s streamed · ${toolSeconds.toFixed(1)}s tools · ${totalSeconds.toFixed(1)}s total`)}`
 			: ctx.ui.theme.fg("dim", "no streamed assistant tokens");
 		ctx.ui.notify(`${prefix} ${stats}`, "info");
 		resetCurrentMessage();
