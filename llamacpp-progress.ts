@@ -10,7 +10,11 @@ import {
 	type SimpleStreamOptions,
 	type Tool,
 } from "@earendil-works/pi-ai";
-import { convertMessages } from "/home/ubuntu/.local/share/pi-node/node-v22.22.3-linux-x64/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/providers/openai-completions.js";
+const openAICompletionsModuleUrl = new URL(
+	"./providers/openai-completions.js",
+	import.meta.resolve("@earendil-works/pi-ai"),
+).href;
+const { convertMessages } = await import(openAICompletionsModuleUrl);
 
 const API = "llamacpp-openai-completions";
 
