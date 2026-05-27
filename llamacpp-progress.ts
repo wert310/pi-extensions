@@ -1,4 +1,3 @@
-import { appendFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
 	calculateCost,
@@ -14,18 +13,8 @@ import {
 import { convertMessages } from "/home/ubuntu/.local/share/pi-node/node-v22.22.3-linux-x64/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/providers/openai-completions.js";
 
 const API = "llamacpp-openai-completions";
-const DEBUG = process.env.PI_LLAMACPP_PROGRESS_DEBUG === "1";
-const LOG_FILE = "/tmp/llamacpp-progress.log";
 
 let ui: ExtensionUIContext | undefined;
-
-function debug(message: string, extra?: unknown): void {
-	if (!DEBUG) return;
-	try {
-		const suffix = extra === undefined ? "" : ` ${JSON.stringify(extra)}`;
-		appendFileSync(LOG_FILE, `${new Date().toISOString()} ${message}${suffix}\n`, "utf8");
-	} catch {}
-}
 
 function stripTrailingSlash(url: string): string {
 	return url.replace(/\/+$/, "");
@@ -51,11 +40,19 @@ function formatProgress(progress: { total?: number; cache?: number; processed?: 
 			? Math.max(0, Math.min(100, Math.round((100 * processed) / total)))
 			: 0;
 	const seconds = Math.max(0, Number(progress.time_ms) || 0) / 1000;
+	const tokensPerSecond = seconds > 0 ? uncachedProcessed / seconds : 0;
+	const rate =
+		seconds > 0 && uncachedProcessed > 0
+			? tokensPerSecond >= 100
+				? `${Math.round(tokensPerSecond)} tok/s`
+				: `${tokensPerSecond.toFixed(1)} tok/s`
+			: undefined;
 
 	return [
 		`Prompt ${percent}%`,
 		`${processed}/${total}`,
 		cache > 0 ? `cache ${cache}` : undefined,
+		rate,
 		seconds > 0 ? `${seconds.toFixed(1)}s` : undefined,
 	]
 		.filter(Boolean)
@@ -185,7 +182,6 @@ function buildHeaders(model: Model<any>, options: SimpleStreamOptions | undefine
 export default function llamacppProgress(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		ui = ctx.ui;
-		debug("session_start", { hasUI: ctx.hasUI });
 	});
 
 	pi.on("agent_end", () => {
@@ -200,7 +196,6 @@ export default function llamacppProgress(pi: ExtensionAPI) {
 	pi.registerProvider("llamacpp-progress", {
 		api: API,
 		streamSimple(model, context, options) {
-			debug("streamSimple:start", { provider: model.provider, api: model.api, baseUrl: model.baseUrl, id: model.id });
 			const stream = createAssistantMessageEventStream();
 
 			(async () => {
@@ -229,7 +224,6 @@ export default function llamacppProgress(pi: ExtensionAPI) {
 					const nextPayload = (await options?.onPayload?.(payload, model)) ?? payload;
 					const headers = buildHeaders(model, options, apiKey);
 					const url = `${stripTrailingSlash(model.baseUrl)}/chat/completions`;
-					debug("request", { url, payloadKeys: Object.keys(nextPayload as object) });
 					const response = await fetch(url, {
 						method: "POST",
 						headers,
@@ -237,7 +231,6 @@ export default function llamacppProgress(pi: ExtensionAPI) {
 						signal: options?.signal,
 					});
 					await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
-					debug("response", { status: response.status, contentType: response.headers.get("content-type") });
 
 					if (!response.ok) {
 						throw new Error(`OpenAI API error (${response.status}): ${await response.text()}`);
@@ -330,9 +323,7 @@ export default function llamacppProgress(pi: ExtensionAPI) {
 						}
 						if (chunk.prompt_progress) {
 							sawPromptProgress = true;
-							const message = formatProgress(chunk.prompt_progress);
-							debug("prompt_progress", { message, progress: chunk.prompt_progress });
-							ui?.setWorkingMessage(message);
+							ui?.setWorkingMessage(formatProgress(chunk.prompt_progress));
 						}
 						const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
 						if (!choice) return;
