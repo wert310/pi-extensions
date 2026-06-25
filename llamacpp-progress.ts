@@ -11,7 +11,7 @@ import {
 	type Tool,
 } from "@earendil-works/pi-ai";
 const openAICompletionsModuleUrl = new URL(
-	"./providers/openai-completions.js",
+	"./api/openai-completions.js",
 	import.meta.resolve("@earendil-works/pi-ai"),
 ).href;
 const { convertMessages } = await import(openAICompletionsModuleUrl);
