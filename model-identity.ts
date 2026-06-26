@@ -62,10 +62,7 @@ export default function (pi: ExtensionAPI) {
 		// Model identity instruction - minimal and clear
 		const modelIdentity = [
 			"",
-			"## Your Identity",
 			`You are running as: **${currentModel.provider}/${currentModel.id}**`,
-			"When making git commits, attribute your work using the co-author format.",
-			"See the `commit-co-author` skill for attribution guidelines.",
 		].join("\n");
 
 		return {
