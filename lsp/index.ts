@@ -703,6 +703,26 @@ async function shutdownServers(): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Check if extension is enabled (default: true for backward compatibility)
+  const isEnabled = () => {
+    try {
+      const settingsPath = path.join(homedir(), ".pi", "agent", "settings.json");
+      if (fs.existsSync(settingsPath)) {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+        // Explicit false disables, everything else (including undefined) enables
+        return settings.extensionSettings?.lsp !== false;
+      }
+    } catch {
+      // On error, default to enabled for backward compatibility
+    }
+    return true;
+  };
+
+  // Don't register any hooks if disabled
+  if (!isEnabled()) {
+    return;
+  }
+
   let showStatus = false;
   let warmingUp = false;
   let startFailed = false;
