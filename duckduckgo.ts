@@ -261,9 +261,15 @@ export const duckDuckGoTool = defineTool({
 		}
 
 		const details = result.details as DuckDuckGoSearchPayload | undefined;
-		if (!expanded) {
-			const count = details?.results.length ?? 0;
-			return new Text(theme.fg("success", `${count} result${count === 1 ? "" : "s"}`), 0, 0);
+		if (!expanded && details) {
+			const count = details.results.length ?? 0;
+			const label = (text: string) => theme.fg("success", theme.bold(text));
+			const value = (text: string) => theme.fg("toolOutput", text);
+			const lines = [
+				`${label("Query:")} ${value(details.query)}`,
+				`${label("Results:")} ${value(`${count} result${count === 1 ? "" : "s"}`)}`,
+			];
+			return new Text(lines.join("\n"), 0, 0);
 		}
 
 		const content = result.content.find((item) => item.type === "text");
