@@ -25,8 +25,17 @@ export default function (pi: ExtensionAPI) {
         await ctx.waitForIdle();
       }
       // Empty prompt array = runAgentLoop with unmodified context snapshot
-      // The LLM sees exactly the same messages it had before
-      await _agent.prompt([]);
+      // The LLM sees exactly the same messages it had before.
+      //
+      // Do NOT await the loop here. pi's RPC prompt path only emits this command's
+      // success response AFTER the handler returns, and the webui's RpcClient.prompt()
+      // times out after 30s. A normal prompt returns immediately because preflight
+      // fires before the loop runs — mirror that by starting the loop without awaiting.
+      // Agent events (message_start/part.updated/agent_end) still stream to the UI via
+      // the session bus, so the continue is visible exactly like a normal prompt.
+      void _agent.prompt([]).catch((err) => {
+        ctx.ui.notify(`Continue failed: ${err instanceof Error ? err.message : String(err)}`, "error")
+      })
     },
   });
 }
