@@ -1,4 +1,5 @@
 {
   "worktreeSetupHook": "~/.pi/agent/scripts/setup-worktree.mjs",
-  "worktreeSetupHookTimeoutMs": 120000
+  "worktreeSetupHookTimeoutMs": 120000,
+  "maxSubagentSpawnsPerSession": 100
 }

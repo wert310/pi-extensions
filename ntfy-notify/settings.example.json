@@ -1,0 +1,13 @@
+{
+  "ntfy": {
+    "server": "ntfy.puyral.fr",
+    "token": "tk_your_token_here",
+    "topic": "ai-pi-notifications",
+    "enabled": true,
+    "notifyOn": {
+      "agentEnd": true,
+      "sessionShutdown": false,
+      "error": true
+    }
+  }
+}
