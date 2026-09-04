@@ -1,0 +1,9 @@
+{
+	"name": "pi-agent-extensions",
+	"private": true,
+	"description": "Custom extensions for the pi coding agent",
+	"type": "module",
+	"dependencies": {
+		"@earendil-works/pi-ai": "0.84.3"
+	}
+}
